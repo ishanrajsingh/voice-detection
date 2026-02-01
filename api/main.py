@@ -3,7 +3,7 @@ import base64
 import tempfile
 import os
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 
 import torch
@@ -112,8 +112,15 @@ def predict(path):
 @app.post("/api/voice-detection")
 async def detect_voice(
     payload: VoiceDetectRequest,
+    request: Request,
     _: bool = Depends(verify_auth_key)
 ):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > 8 * 1024 * 1024:  # 8 MB
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file too large (max 8MB)"
+        )
     language = payload.language.lower()
     audio_format = payload.audioFormat.lower()
     audio_b64 = payload.audioBase64
