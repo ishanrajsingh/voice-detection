@@ -48,24 +48,34 @@ async def verify_auth_key(auth_key: str = Depends(auth_key_header)):
     return True
 
 # ------------------------------------------------------------------
-# LOAD MODEL
-# ------------------------------------------------------------------
-
-with open(CONFIG_PATH, "r") as f:
-    cfg = yaml.safe_load(f)
-
-model = RawNet(cfg["model"], DEVICE)
-ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-model.load_state_dict(ckpt)
-model.eval()
-
-print("RawNet2 Model Loaded")
-
-# ------------------------------------------------------------------
 # FASTAPI APP
 # ------------------------------------------------------------------
 
 app = FastAPI(title="AI Voice Detection API (RawNet2 - ASVspoof)")
+
+# ------------------------------------------------------------------
+# LOAD MODEL
+# ------------------------------------------------------------------
+
+model = None
+
+@app.on_event("startup")
+def load_model():
+    global model
+    with open(CONFIG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    m = RawNet(cfg["model"], DEVICE)
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+    m.load_state_dict(ckpt)
+    m.eval()
+    model = m
+    print("✅ RawNet2 Model Loaded")
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
 
 # ------------------------------------------------------------------
 # REQUEST SCHEMA
