@@ -1,0 +1,9 @@
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+speechbrain==0.5.16
+torch==2.2.2
+torchaudio==2.2.2
+librosa==0.10.1
+soundfile==0.12.1
+numpy==1.26.4
+python-multipart==0.0.9
