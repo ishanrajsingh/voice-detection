@@ -10,15 +10,16 @@ import torch
 import librosa
 import numpy as np
 import yaml
-
+from dotenv import load_dotenv
 from rawnet.model import RawNet
 from fastapi.security import APIKeyHeader
 
 # ------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------
-
-API_KEY = "sk_test_123456789"
+load_dotenv()
+API_KEY = os.getenv("VOICE_API_KEY")
+print(API_KEY)
 
 SUPPORTED_LANGUAGES = {"tamil", "english", "hindi", "malayalam", "telugu"}
 
