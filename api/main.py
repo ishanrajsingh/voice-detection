@@ -18,7 +18,7 @@ from fastapi.security import APIKeyHeader
 # CONFIG
 # ------------------------------------------------------------------
 
-API_KEY = "sk_test_123456789"
+API_KEY = os.getenv("VOICE_API_KEY")
 
 SUPPORTED_LANGUAGES = {"tamil", "english", "hindi", "malayalam", "telugu"}
 
@@ -144,3 +144,4 @@ async def detect_voice(
         "confidenceScore": confidence,
         
     }
+
