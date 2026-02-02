@@ -18,18 +18,14 @@ from fastapi.security import APIKeyHeader
 # ------------------------------------------------------------------
 # LOGGING
 # ------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voice-detection")
 
 # ------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------
 load_dotenv()
 API_KEY = os.getenv("VOICE_API_KEY")
-logger.info("API key loaded")
 
 SUPPORTED_LANGUAGES = {"tamil", "english", "hindi", "malayalam", "telugu"}
 
@@ -42,6 +38,10 @@ DEVICE = "cpu"
 SPOOF_HIGH_THRESHOLD = 0.85
 SPOOF_MEDIUM_THRESHOLD = 0.65
 
+MAX_AUDIO_SECONDS = 4        # 🔥 critical
+TARGET_SR = 16000
+TARGET_SAMPLES = MAX_AUDIO_SECONDS * TARGET_SR
+
 # ------------------------------------------------------------------
 # AUTH
 # ------------------------------------------------------------------
@@ -50,7 +50,6 @@ auth_key_header = APIKeyHeader(name=AUTH_KEY_NAME, auto_error=False)
 
 async def verify_auth_key(auth_key: str = Depends(auth_key_header)):
     if auth_key != API_KEY:
-        logger.warning("Invalid API key")
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return True
 
@@ -59,20 +58,19 @@ async def verify_auth_key(auth_key: str = Depends(auth_key_header)):
 # ------------------------------------------------------------------
 app = FastAPI(
     title="AI Voice Detection API (RawNet2 - ASVspoof)",
-    docs_url=None,        # prevent Swagger timeout on Render
-    redoc_url=None,
-    openapi_url="/openapi.json"
+    docs_url="/docs",
+    redoc_url=None
 )
 
 # ------------------------------------------------------------------
-# MODEL LOAD (ONCE)
+# LOAD MODEL (ONCE)
 # ------------------------------------------------------------------
 model = None
 
 @app.on_event("startup")
 def load_model():
     global model
-    logger.info("Loading RawNet2 model...")
+    logger.info("Loading RawNet2...")
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -96,24 +94,28 @@ class VoiceDetectRequest(BaseModel):
     audioBase64: str
 
 # ------------------------------------------------------------------
-# TIMEOUT HANDLER
+# TIMEOUT GUARD
 # ------------------------------------------------------------------
 class InferenceTimeout(Exception):
     pass
 
-def _timeout_handler(signum, frame):
+def timeout_handler(signum, frame):
     raise InferenceTimeout()
 
-signal.signal(signal.SIGALRM, _timeout_handler)
+signal.signal(signal.SIGALRM, timeout_handler)
 
 # ------------------------------------------------------------------
-# AUDIO + PREDICTION
+# AUDIO PIPELINE (FIXED)
 # ------------------------------------------------------------------
 def load_audio(path: str):
-    # librosa can hang → keep it minimal
-    wav, _ = librosa.load(path, sr=16000, mono=True)
-    if len(wav) < 64000:
-        wav = np.pad(wav, (0, 64000 - len(wav)))
+    # Decode only once, trim aggressively
+    wav, _ = librosa.load(path, sr=TARGET_SR, mono=True)
+
+    if len(wav) > TARGET_SAMPLES:
+        wav = wav[:TARGET_SAMPLES]
+    elif len(wav) < TARGET_SAMPLES:
+        wav = np.pad(wav, (0, TARGET_SAMPLES - len(wav)))
+
     return torch.tensor(wav).float().unsqueeze(0)
 
 def predict(path: str):
@@ -143,17 +145,13 @@ async def detect_voice(
     request: Request,
     _: bool = Depends(verify_auth_key)
 ):
-    logger.info("Received voice detection request")
-
-    # ---- HARD SIZE LIMIT (Render-safe)
+    # ---- HARD SIZE LIMIT
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 1 * 1024 * 1024:
-        raise HTTPException(413, "Audio file too large (max 1MB)")
+    if content_length and int(content_length) > 1_200_000:
+        raise HTTPException(413, "Audio file too large")
 
-    # ---- VALIDATION
     language = payload.language.lower()
     audio_format = payload.audioFormat.lower()
-    audio_b64 = payload.audioBase64
 
     if language not in SUPPORTED_LANGUAGES:
         raise HTTPException(400, "Unsupported language")
@@ -161,12 +159,8 @@ async def detect_voice(
     if audio_format != "mp3":
         raise HTTPException(400, "Only mp3 audio format supported")
 
-    # ---- EARLY BASE64 GUARD
-    if len(audio_b64) < 5000:
-        raise HTTPException(400, "Invalid or empty audio payload")
-
     try:
-        audio_bytes = base64.b64decode(audio_b64)
+        audio_bytes = base64.b64decode(payload.audioBase64)
     except Exception:
         raise HTTPException(400, "Invalid base64 audio")
 
@@ -175,17 +169,13 @@ async def detect_voice(
         audio_path = tmp.name
 
     try:
-        # ---- HARD INFERENCE TIMEOUT (15s)
-        signal.alarm(15)
+        signal.alarm(12)   # 🔥 must be < gateway timeout
         classification, confidence, risk = predict(audio_path)
     except InferenceTimeout:
-        logger.error("Inference timeout")
         raise HTTPException(504, "Inference timeout")
     finally:
         signal.alarm(0)
         os.remove(audio_path)
-
-    logger.info("Inference complete")
 
     return {
         "status": "success",
