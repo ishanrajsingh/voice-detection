@@ -38,9 +38,8 @@ DEVICE = "cpu"
 SPOOF_HIGH_THRESHOLD = 0.85
 SPOOF_MEDIUM_THRESHOLD = 0.65
 
-MAX_AUDIO_SECONDS = 4        # 🔥 critical
 TARGET_SR = 16000
-TARGET_SAMPLES = MAX_AUDIO_SECONDS * TARGET_SR
+TARGET_SAMPLES = 4 * TARGET_SR   # 4 seconds (RawNet standard)
 
 # ------------------------------------------------------------------
 # AUTH
@@ -56,14 +55,10 @@ async def verify_auth_key(auth_key: str = Depends(auth_key_header)):
 # ------------------------------------------------------------------
 # FASTAPI APP
 # ------------------------------------------------------------------
-app = FastAPI(
-    title="AI Voice Detection API (RawNet2 - ASVspoof)",
-    docs_url="/docs",
-    redoc_url=None
-)
+app = FastAPI(title="AI Voice Detection API (RawNet2 - ASVspoof)")
 
 # ------------------------------------------------------------------
-# LOAD MODEL (ONCE)
+# MODEL
 # ------------------------------------------------------------------
 model = None
 
@@ -71,15 +66,22 @@ model = None
 def load_model():
     global model
     logger.info("Loading RawNet2...")
+
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
-    m = RawNet(cfg["model"], DEVICE)
+    model = RawNet(cfg["model"], DEVICE)
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-    m.load_state_dict(ckpt)
-    m.eval()
-    model = m
-    logger.info("✅ RawNet2 Model Loaded")
+    model.load_state_dict(ckpt)
+    model.eval()
+
+    # 🔥 CRITICAL: NUMBA / LLVM WARMUP
+    logger.info("Warming up model (JIT compile)...")
+    dummy_audio = torch.zeros(1, TARGET_SAMPLES)
+    with torch.no_grad():
+        _ = model(dummy_audio)
+
+    logger.info("✅ RawNet2 Model Loaded & Warmed")
 
 @app.get("/")
 def health():
@@ -94,21 +96,9 @@ class VoiceDetectRequest(BaseModel):
     audioBase64: str
 
 # ------------------------------------------------------------------
-# TIMEOUT GUARD
+# AUDIO PIPELINE
 # ------------------------------------------------------------------
-class InferenceTimeout(Exception):
-    pass
-
-def timeout_handler(signum, frame):
-    raise InferenceTimeout()
-
-signal.signal(signal.SIGALRM, timeout_handler)
-
-# ------------------------------------------------------------------
-# AUDIO PIPELINE (FIXED)
-# ------------------------------------------------------------------
-def load_audio(path: str):
-    # Decode only once, trim aggressively
+def load_audio(path):
     wav, _ = librosa.load(path, sr=TARGET_SR, mono=True)
 
     if len(wav) > TARGET_SAMPLES:
@@ -118,23 +108,21 @@ def load_audio(path: str):
 
     return torch.tensor(wav).float().unsqueeze(0)
 
-def predict(path: str):
+def predict(path):
     audio = load_audio(path)
+
     with torch.no_grad():
         out = model(audio)
         prob_spoof = torch.softmax(out, dim=1)[0][0].item()
 
     if prob_spoof >= SPOOF_HIGH_THRESHOLD:
         label = "AI_GENERATED"
-        risk = "high"
     elif prob_spoof >= SPOOF_MEDIUM_THRESHOLD:
         label = "SUSPECTED_AI"
-        risk = "medium"
     else:
         label = "HUMAN"
-        risk = "low"
 
-    return label, round(prob_spoof, 4), risk
+    return label, round(prob_spoof, 4)
 
 # ------------------------------------------------------------------
 # API ENDPOINT
@@ -145,11 +133,6 @@ async def detect_voice(
     request: Request,
     _: bool = Depends(verify_auth_key)
 ):
-    # ---- HARD SIZE LIMIT
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 1_200_000:
-        raise HTTPException(413, "Audio file too large")
-
     language = payload.language.lower()
     audio_format = payload.audioFormat.lower()
 
@@ -169,12 +152,8 @@ async def detect_voice(
         audio_path = tmp.name
 
     try:
-        signal.alarm(12)   # 🔥 must be < gateway timeout
-        classification, confidence, risk = predict(audio_path)
-    except InferenceTimeout:
-        raise HTTPException(504, "Inference timeout")
+        classification, confidence = predict(audio_path)
     finally:
-        signal.alarm(0)
         os.remove(audio_path)
 
     return {
