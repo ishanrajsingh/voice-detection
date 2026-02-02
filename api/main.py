@@ -2,6 +2,7 @@ import logging
 import base64
 import tempfile
 import os
+import signal
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
@@ -15,11 +16,20 @@ from rawnet.model import RawNet
 from fastapi.security import APIKeyHeader
 
 # ------------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------
 load_dotenv()
 API_KEY = os.getenv("VOICE_API_KEY")
-print(API_KEY)
+logger.info("API key loaded")
 
 SUPPORTED_LANGUAGES = {"tamil", "english", "hindi", "malayalam", "telugu"}
 
@@ -35,33 +45,34 @@ SPOOF_MEDIUM_THRESHOLD = 0.65
 # ------------------------------------------------------------------
 # AUTH
 # ------------------------------------------------------------------
-
 AUTH_KEY_NAME = "x-api-key"
 auth_key_header = APIKeyHeader(name=AUTH_KEY_NAME, auto_error=False)
 
 async def verify_auth_key(auth_key: str = Depends(auth_key_header)):
     if auth_key != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key"
-        )
+        logger.warning("Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return True
 
 # ------------------------------------------------------------------
 # FASTAPI APP
 # ------------------------------------------------------------------
-
-app = FastAPI(title="AI Voice Detection API (RawNet2 - ASVspoof)")
+app = FastAPI(
+    title="AI Voice Detection API (RawNet2 - ASVspoof)",
+    docs_url=None,        # prevent Swagger timeout on Render
+    redoc_url=None,
+    openapi_url="/openapi.json"
+)
 
 # ------------------------------------------------------------------
-# LOAD MODEL
+# MODEL LOAD (ONCE)
 # ------------------------------------------------------------------
-
 model = None
 
 @app.on_event("startup")
 def load_model():
     global model
+    logger.info("Loading RawNet2 model...")
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -70,38 +81,46 @@ def load_model():
     m.load_state_dict(ckpt)
     m.eval()
     model = m
-    print("✅ RawNet2 Model Loaded")
+    logger.info("✅ RawNet2 Model Loaded")
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
-
 # ------------------------------------------------------------------
 # REQUEST SCHEMA
 # ------------------------------------------------------------------
-
 class VoiceDetectRequest(BaseModel):
     language: str
     audioFormat: str
     audioBase64: str
 
 # ------------------------------------------------------------------
+# TIMEOUT HANDLER
+# ------------------------------------------------------------------
+class InferenceTimeout(Exception):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise InferenceTimeout()
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+
+# ------------------------------------------------------------------
 # AUDIO + PREDICTION
 # ------------------------------------------------------------------
-
-def load_audio(path):
-    wav, sr = librosa.load(path, sr=16000)
+def load_audio(path: str):
+    # librosa can hang → keep it minimal
+    wav, _ = librosa.load(path, sr=16000, mono=True)
     if len(wav) < 64000:
         wav = np.pad(wav, (0, 64000 - len(wav)))
     return torch.tensor(wav).float().unsqueeze(0)
 
-def predict(path):
+def predict(path: str):
     audio = load_audio(path)
-
     with torch.no_grad():
         out = model(audio)
-        prob_spoof = torch.softmax(out, dim=1)[0][0].item()  # class 0 = spoof
+        prob_spoof = torch.softmax(out, dim=1)[0][0].item()
 
     if prob_spoof >= SPOOF_HIGH_THRESHOLD:
         label = "AI_GENERATED"
@@ -118,47 +137,59 @@ def predict(path):
 # ------------------------------------------------------------------
 # API ENDPOINT
 # ------------------------------------------------------------------
-
 @app.post("/api/voice-detection")
 async def detect_voice(
     payload: VoiceDetectRequest,
     request: Request,
     _: bool = Depends(verify_auth_key)
 ):
+    logger.info("Received voice detection request")
+
+    # ---- HARD SIZE LIMIT (Render-safe)
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 8 * 1024 * 1024:  # 8 MB
-        raise HTTPException(
-            status_code=413,
-            detail="Audio file too large (max 8MB)"
-        )
+    if content_length and int(content_length) > 1 * 1024 * 1024:
+        raise HTTPException(413, "Audio file too large (max 1MB)")
+
+    # ---- VALIDATION
     language = payload.language.lower()
     audio_format = payload.audioFormat.lower()
     audio_b64 = payload.audioBase64
 
     if language not in SUPPORTED_LANGUAGES:
-        raise HTTPException(status_code=400, detail="Unsupported language")
+        raise HTTPException(400, "Unsupported language")
 
     if audio_format != "mp3":
-        raise HTTPException(status_code=400, detail="Only mp3 audio format supported")
+        raise HTTPException(400, "Only mp3 audio format supported")
+
+    # ---- EARLY BASE64 GUARD
+    if len(audio_b64) < 5000:
+        raise HTTPException(400, "Invalid or empty audio payload")
 
     try:
         audio_bytes = base64.b64decode(audio_b64)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 audio")
+        raise HTTPException(400, "Invalid base64 audio")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         audio_path = tmp.name
 
     try:
+        # ---- HARD INFERENCE TIMEOUT (15s)
+        signal.alarm(15)
         classification, confidence, risk = predict(audio_path)
+    except InferenceTimeout:
+        logger.error("Inference timeout")
+        raise HTTPException(504, "Inference timeout")
     finally:
+        signal.alarm(0)
         os.remove(audio_path)
+
+    logger.info("Inference complete")
 
     return {
         "status": "success",
         "language": payload.language,
         "classification": classification,
-        "confidenceScore": confidence,
-        
+        "confidenceScore": confidence
     }
